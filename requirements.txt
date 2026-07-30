@@ -1,0 +1,32 @@
+
+# ---------------------------------------------------------------------------
+# AI-MeshOptimizer requirements
+#
+# PyTorch and PyTorch Geometric are hardware/CUDA-version specific.
+# Install them FIRST using the official selectors, then install the rest
+# of this file. See README.md > Installation for exact commands
+# (CPU / CUDA / Google Colab).
+# ---------------------------------------------------------------------------
+
+torch>=2.1.0
+torch-geometric>=2.4.0
+
+# Mesh I/O and processing
+trimesh>=4.0.0
+open3d>=0.18.0
+pyfqmr>=0.2.0
+networkx>=3.2
+
+# Numerics
+numpy>=1.26.0
+scipy>=1.11.0
+
+# Trimesh optional-but-required backends for robust I/O / ray queries
+rtree>=1.1.0
+
+# Training utilities
+tqdm>=4.66.0
+matplotlib>=3.8.0
+
+# Mesh export / misc formats
+plyfile>=1.0.3

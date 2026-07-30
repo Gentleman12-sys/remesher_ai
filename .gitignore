@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# dataset/raw/ and dataset/pairs/ intentionally track the small procedurally
+# generated sample dataset (see dataset/make_sample_dataset.py). If you drop a
+# real large-scale dataset (ABC/Objaverse/Thingi10K) into dataset/raw/, add
+# your own local override here rather than committing it.
+
+# processed graphs are regenerable derived artifacts (preprocessing/generate_pairs.py
+# or dataset/make_sample_dataset.py) and can be large -- don't commit them.
+dataset/processed/*
+!dataset/processed/.gitkeep
+
+checkpoints/
+
+*.egg-info/
+.venv/
+venv/
+.DS_Store
