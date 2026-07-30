@@ -14,6 +14,14 @@ Pipeline:
 If no trained checkpoint is found, the tool still runs end-to-end using
 plain (unweighted) QEM simplification, with a warning -- there is no hard
 dependency on a pretrained model to be useful.
+
+Multi-object scenes (a mesh made of several disconnected parts -- a full
+scan/scene, not a single sculpted object) are simplified per-component via
+utils.qem.simplify_mesh_by_component, NOT with one global collapse pass:
+a global pass compares absolute QEM cost across the whole scene, which is
+scale-blind and tends to gut large/flat objects while leaving small ones
+completely untouched. Splitting first and giving each component the same
+proportional target keeps every object's relative level of detail.
 """
 
 from __future__ import annotations
@@ -31,7 +39,7 @@ from models.mesh_gnn import MeshGNN
 from preprocessing.feature_extractor import extract_edge_features, extract_node_features
 from preprocessing.mesh_loader import export_mesh, load_mesh, mesh_from_arrays
 from utils.mesh_quality import quality_report
-from utils.qem import WeightedQEMSimplifier
+from utils.qem import simplify_mesh_by_component
 
 
 def get_device(requested: str) -> torch.device:
@@ -41,11 +49,11 @@ def get_device(requested: str) -> torch.device:
 
 
 def predict_edge_importance(mesh, checkpoint_path: str, device: torch.device):
-    """Returns a dict {(i, j): importance in [0, 1]} for every unique edge, or None if no checkpoint."""
+    """Returns (unique_edges (E,2), unique_scores (E,)) for every unique edge, or (None, None) if no checkpoint."""
     ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
         print(f"[WARN] Checkpoint '{checkpoint_path}' not found -- falling back to unweighted QEM.")
-        return None
+        return None, None
 
     node_features = extract_node_features(mesh)
     edge_index_directed, edge_attr_directed, unique_edges, _ = extract_edge_features(mesh)
@@ -68,7 +76,7 @@ def predict_edge_importance(mesh, checkpoint_path: str, device: torch.device):
         scores_directed = model(x, edge_index, edge_attr)
         unique_scores = MeshGNN.to_undirected_scores(scores_directed).cpu().numpy()
 
-    return {(int(i), int(j)): float(s) for (i, j), s in zip(unique_edges, unique_scores)}
+    return unique_edges, unique_scores
 
 
 def remesh(
@@ -77,6 +85,7 @@ def remesh(
     target_faces: int,
     checkpoint_path: str = "checkpoints/best_model.pt",
     importance_strength: float = 8.0,
+    min_component_faces: int = 50,
     device_str: str = "auto",
     compare: bool = False,
 ):
@@ -95,23 +104,35 @@ def remesh(
         export_mesh(mesh, output_path)
         return mesh, mesh
 
-    edge_importance = predict_edge_importance(mesh, checkpoint_path, device)
-    mode = "GNN feature-weighted QEM" if edge_importance is not None else "plain QEM"
+    edge_edges, edge_scores = predict_edge_importance(mesh, checkpoint_path, device)
+    mode = "GNN feature-weighted QEM" if edge_edges is not None else "plain QEM"
     print(f"Simplifying {original_faces} -> {target_faces} faces using {mode} ...")
 
     t0 = time.time()
-    simplifier = WeightedQEMSimplifier(mesh.vertices, mesh.faces)
-    new_vertices, new_faces = simplifier.simplify(
+    new_vertices, new_faces, stats = simplify_mesh_by_component(
+        mesh.vertices,
+        mesh.faces,
         target_faces=target_faces,
-        edge_importance=edge_importance,
+        edge_importance_edges=edge_edges,
+        edge_importance_scores=edge_scores,
         importance_strength=importance_strength,
+        min_component_faces=min_component_faces,
     )
     elapsed = time.time() - t0
 
     simplified = mesh_from_arrays(new_vertices, new_faces)
     export_mesh(simplified, output_path)
 
-    print(f"Done in {elapsed:.1f}s. Output: {len(simplified.vertices)} vertices, {len(simplified.faces)} faces")
+    print(
+        f"Done in {elapsed:.1f}s. Output: {len(simplified.vertices)} vertices, {len(simplified.faces)} faces "
+        f"(requested {target_faces}; per-component allocation lands close but not always exact)"
+    )
+    if stats["components"] > 1:
+        print(
+            f"Mesh had {stats['components']} separate connected components: "
+            f"{stats['simplified']} simplified proportionally, "
+            f"{stats['kept_small']} kept as-is (< {min_component_faces} faces, already minimal)."
+        )
     print(f"Saved -> {output_path}")
 
     if compare:
@@ -139,6 +160,13 @@ def main():
         default=8.0,
         help="How strongly GNN-predicted importance inflates edge-collapse cost.",
     )
+    parser.add_argument(
+        "--min_component_faces",
+        type=int,
+        default=50,
+        help="Connected components smaller than this are left untouched instead of being "
+        "forced down to a proportional target (avoids mangling small scene details).",
+    )
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--compare", action="store_true", help="Print a Hausdorff/Chamfer/normal quality report.")
     args = parser.parse_args()
@@ -149,6 +177,7 @@ def main():
         target_faces=args.target_faces,
         checkpoint_path=args.checkpoint,
         importance_strength=args.importance_strength,
+        min_component_faces=args.min_component_faces,
         device_str=args.device,
         compare=args.compare,
     )

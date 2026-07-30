@@ -23,6 +23,20 @@ This module has two public entry points:
         Runs the actual edge-collapse decimation to a target face count,
         optionally biased by a per-edge importance dict.
 
+    simplify_mesh_by_component(vertices, faces, target_faces, ...)
+        Wraps WeightedQEMSimplifier to handle multi-object scenes correctly:
+        splits the mesh into connected components first and simplifies each
+        one to its OWN proportional target face count, instead of running one
+        global collapse queue across the whole scene. Global collapse is
+        scale-blind -- absolute quadric-error cost, not relative importance,
+        decides what gets collapsed first, so a single global run tends to
+        gut large/flat objects while leaving small/detailed ones completely
+        untouched (their few edges are never the cheapest in the whole scene)
+        and can fuse separate objects together at contact points. Always
+        prefer this over calling WeightedQEMSimplifier directly on a mesh
+        that might contain more than one disconnected object -- see
+        inference/remesh.py, which uses it exclusively.
+
 No third-party decimation library is required: pyfqmr (used in
 preprocessing/generate_pairs.py) does not support externally supplied
 per-edge weights, so this hand-written simplifier is what actually powers
@@ -32,9 +46,11 @@ per-edge weights, so this hand-written simplifier is what actually powers
 from __future__ import annotations
 
 import heapq
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components as _scipy_connected_components
 
 
 def _face_planes(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -161,6 +177,29 @@ class WeightedQEMSimplifier:
             cost = cost * (1.0 + strength * importance)
         return cost, v_bar
 
+    def _link_condition_ok(self, i: int, j: int) -> bool:
+        """
+        Standard mesh-simplification "link condition" (Dey et al.): collapsing
+        edge (i, j) is only topology-safe if the vertices adjacent to BOTH i
+        and j are exactly the (at most two) apex vertices of the triangles
+        that contain edge (i, j) -- no more, no fewer. If some other vertex k
+        is adjacent to both i and j without (i, j, k) being a face, i and j
+        are only "close" through some other part of the mesh (e.g. opposite
+        sides of a thin neck/handle), and collapsing them would pinch or tear
+        the surface -- silently disconnecting it into extra pieces, or fusing
+        parts that should stay separate. Skipping such collapses is what
+        keeps a thin handle/leg/spout attached instead of getting severed.
+        """
+        common_neighbors = (self._neighbors(i) & self._neighbors(j)) - {i, j}
+
+        expected_apexes = set()
+        for fid in self.vertex_faces[i] & self.vertex_faces[j]:
+            face = self.faces[fid]
+            if i in face and j in face:
+                expected_apexes.update(v for v in face if v != i and v != j)
+
+        return common_neighbors == expected_apexes
+
     def simplify(
         self,
         target_faces: int,
@@ -190,6 +229,8 @@ class WeightedQEMSimplifier:
                 continue
             if self.version[i] != vi or self.version[j] != vj:
                 continue  # stale entry, one of the endpoints changed since this was pushed
+            if not self._link_condition_ok(i, j):
+                continue  # collapsing here would tear/pinch the mesh -- leave it alone
 
             current_faces -= self._collapse_edge(i, j, v_bar)
 
@@ -245,3 +286,182 @@ class WeightedQEMSimplifier:
                 new_faces.append([old_to_new[v] for v in face])
 
         return np.array(new_vertices, dtype=np.float64), np.array(new_faces, dtype=np.int64)
+
+
+def _split_into_components(vertices: np.ndarray, faces: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Split a mesh into separate objects, using FACE adjacency (two faces are
+    connected iff they share a full edge, i.e. 2 vertices) -- NOT vertex
+    adjacency. A vertex-based split over-merges: two genuinely separate
+    objects that merely touch at a single shared vertex (a "bowtie" contact
+    point -- common in multi-object scenes/scans, e.g. a fork resting against
+    a plate) would be treated as one component, and the QEM collapse queue
+    would then happily eat the smaller touching object from inside what it
+    thinks is a single blob. Face/edge adjacency matches how a 3D viewer (and
+    trimesh.Trimesh.split()) actually defines "separate object".
+
+    Returns a list of (global_vertex_indices, local_faces) pairs: for each
+    component, the indices of its vertices into the ORIGINAL `vertices` array,
+    and its faces re-indexed to be local to that component (0..len(component)-1).
+    """
+    n_vertices = len(vertices)
+    n_faces = len(faces)
+    if n_faces == 0:
+        return []
+
+    edges = np.sort(
+        np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0), axis=1
+    )
+    face_ids = np.tile(np.arange(n_faces), 3)
+
+    order = np.lexsort((edges[:, 1], edges[:, 0]))
+    edges_sorted = edges[order]
+    face_ids_sorted = face_ids[order]
+
+    # consecutive rows with an identical edge -> their owning faces share that edge
+    shares_edge = np.all(edges_sorted[:-1] == edges_sorted[1:], axis=1)
+    face_rows = face_ids_sorted[:-1][shares_edge]
+    face_cols = face_ids_sorted[1:][shares_edge]
+
+    if len(face_rows) > 0:
+        face_graph = coo_matrix(
+            (np.ones(len(face_rows), dtype=np.int8), (face_rows, face_cols)), shape=(n_faces, n_faces)
+        )
+        _, face_labels = _scipy_connected_components(face_graph, directed=False)
+    else:
+        face_labels = np.arange(n_faces)  # every face is its own component (no shared edges at all)
+
+    components = []
+    for comp_id in np.unique(face_labels):
+        comp_faces_global = faces[face_labels == comp_id]
+        vertex_indices = np.unique(comp_faces_global)
+        local_index = np.full(n_vertices, -1, dtype=np.int64)
+        local_index[vertex_indices] = np.arange(len(vertex_indices))
+        comp_faces_local = local_index[comp_faces_global]
+        components.append((vertex_indices, comp_faces_local))
+
+    return components
+
+
+def _drop_tiny_fragments(
+    vertices: np.ndarray, faces: np.ndarray, min_fragment_faces: int = 4
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Defensive cleanup: the link-condition check in WeightedQEMSimplifier
+    prevents almost all topology-tearing collapses, but on messy/near-degenerate
+    real-world geometry (thin necks, near-coincident vertices) a handful of
+    tiny (often single-face) debris shards can still split off. A stray
+    floating triangle reads as visual noise, not detail worth keeping, so drop
+    any post-simplification fragment smaller than `min_fragment_faces` --
+    unless that would remove everything, in which case keep the largest one.
+
+    Returns (vertices, faces, n_fragments_dropped).
+    """
+    if len(faces) == 0:
+        return vertices, faces, 0
+
+    subcomponents = _split_into_components(vertices, faces)
+    if len(subcomponents) <= 1:
+        return vertices, faces, 0
+
+    kept = [vertex_indices[local_faces] for vertex_indices, local_faces in subcomponents if len(local_faces) >= min_fragment_faces]
+    n_dropped = len(subcomponents) - len(kept)
+
+    if not kept:
+        largest = max(subcomponents, key=lambda c: len(c[1]))
+        kept = [largest[0][largest[1]]]
+        n_dropped = len(subcomponents) - 1
+
+    new_faces = np.concatenate(kept, axis=0)
+    used_vertices = np.unique(new_faces)
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used_vertices] = np.arange(len(used_vertices))
+    return vertices[used_vertices], remap[new_faces], n_dropped
+
+
+def simplify_mesh_by_component(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_faces: int,
+    edge_importance_edges: Optional[np.ndarray] = None,
+    edge_importance_scores: Optional[np.ndarray] = None,
+    importance_strength: float = 8.0,
+    min_component_faces: int = 50,
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    Simplify a (possibly multi-object) mesh to `target_faces`, splitting into
+    connected components first and giving each one the SAME proportional
+    reduction (component_target = component_faces * target_faces / total_faces),
+    so a big flat object and a small detailed one lose the same relative
+    fraction of detail instead of one dominating a global collapse queue.
+
+    edge_importance_edges/_scores: optional (E, 2) / (E,) arrays of GNN-predicted
+    per-edge importance, keyed by GLOBAL vertex indices (as returned by
+    inference/remesh.py's predict_edge_importance) -- remapped to each
+    component's local indices internally.
+
+    Components smaller than `min_component_faces` are left untouched: below
+    that size a component is "a small detail", not "a simplification target",
+    and forcing it down to a proportional target would just mangle it.
+
+    Returns (new_vertices, new_faces, stats) where stats reports how many
+    components were simplified vs. kept as-is, for transparency.
+    """
+    components = _split_into_components(vertices, faces)
+    if not components:
+        return vertices.copy(), faces.copy(), {"components": 0, "simplified": 0, "kept_small": 0}
+
+    total_faces = sum(len(f) for _, f in components)
+    global_ratio = target_faces / max(1, total_faces)
+
+    has_importance = edge_importance_edges is not None and len(edge_importance_edges) > 0
+
+    out_vertices, out_faces = [], []
+    vertex_offset = 0
+    simplified_count, kept_small_count, debris_dropped = 0, 0, 0
+
+    for vertex_indices, comp_faces_local in components:
+        comp_vertices = vertices[vertex_indices]
+        comp_face_count = len(comp_faces_local)
+        comp_target = max(4, round(comp_face_count * global_ratio))
+
+        if comp_face_count < min_component_faces or comp_target >= comp_face_count:
+            new_v, new_f = comp_vertices, comp_faces_local
+            kept_small_count += 1
+        else:
+            local_importance = None
+            if has_importance:
+                vertex_mask = np.zeros(len(vertices), dtype=bool)
+                vertex_mask[vertex_indices] = True
+                edge_mask = vertex_mask[edge_importance_edges[:, 0]] & vertex_mask[edge_importance_edges[:, 1]]
+                if edge_mask.any():
+                    global_to_local = np.full(len(vertices), -1, dtype=np.int64)
+                    global_to_local[vertex_indices] = np.arange(len(vertex_indices))
+                    comp_edges_local = global_to_local[edge_importance_edges[edge_mask]]
+                    comp_scores = edge_importance_scores[edge_mask]
+                    local_importance = {
+                        (int(i), int(j)) if i < j else (int(j), int(i)): float(s)
+                        for (i, j), s in zip(comp_edges_local, comp_scores)
+                    }
+
+            simplifier = WeightedQEMSimplifier(comp_vertices, comp_faces_local)
+            new_v, new_f = simplifier.simplify(
+                target_faces=comp_target, edge_importance=local_importance, importance_strength=importance_strength
+            )
+            new_v, new_f, n_dropped = _drop_tiny_fragments(new_v, new_f)
+            debris_dropped += n_dropped
+            simplified_count += 1
+
+        out_vertices.append(new_v)
+        out_faces.append(new_f + vertex_offset)
+        vertex_offset += len(new_v)
+
+    combined_vertices = np.concatenate(out_vertices, axis=0)
+    combined_faces = np.concatenate(out_faces, axis=0)
+    stats = {
+        "components": len(components),
+        "simplified": simplified_count,
+        "kept_small": kept_small_count,
+        "debris_fragments_dropped": debris_dropped,
+    }
+    return combined_vertices, combined_faces, stats
