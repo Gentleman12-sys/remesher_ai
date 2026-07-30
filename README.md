@@ -109,46 +109,60 @@ fixtures, not confirmed public-domain redistributables. This repo doesn't
 vendor them for that reason; if you want to use them, pull them into your own
 `dataset/raw/` and check the license situation for your use case first.
 
-### Sample dataset (included, license-clean, no download required)
+### Procedural sample dataset (included, license-clean, no download required)
 
-`dataset/make_sample_dataset.py` procedurally generates a small demo set --
-two **complex** meshes (many polygons / intricate curvature) and two
-**simple** meshes (few polygons / basic shapes) -- each already paired with
-an AI-MeshOptimizer-generated optimized counterpart. Everything is built with
-trimesh + numpy, so there's no licensing ambiguity and no external download:
+`dataset/make_sample_dataset.py` procedurally generates raw meshes across four
+categories -- no external download, no licensing ambiguity, everything built
+from closed-form formulas with trimesh + numpy:
 
-```bash
-python dataset/make_sample_dataset.py
-```
+| category | meaning | typical faces |
+|---|---|---:|
+| `complex_knot` | **complex**: twisting torus-knot tubes, high curvature variation | ~5,000-14,000 |
+| `organic_blob` | **complex**: noise-displaced icospheres, sculpt-like surfaces | ~1,300-20,500 |
+| `box_simple` | **simple**: lightly subdivided boxes, flat, few features | ~50-770 |
+| `sphere_simple` | **simple**: low-subdivision icospheres, rounded, few features | ~80-1,280 |
 
-| name | category | faces (high) | faces (low) | reduction | hausdorff | chamfer |
-|---|---|---:|---:|---:|---:|---:|
-| `torus_knot_complex` | complex | 18,720 | 1,500 | 92.0% | 0.127 | 0.0029 |
-| `organic_blob_complex` | complex | 20,480 | 1,200 | 94.1% | 0.065 | 0.0006 |
-| `box_simple` | simple | 192 | 48 | 75.0% | 0.236 | 0.0086 |
-| `icosphere_simple` | simple | 80 | 40 | 50.0% | 0.261 | 0.0180 |
+Each instance in a category randomizes its generating parameters (knot
+winding numbers, tube radius, resolution, noise frequency/seed, box extents,
+subdivision level, scale, rotation, ...), so `--count_per_category 750` gives
+750 *genuinely different* shapes per category, not copies.
 
-- **Complex**: `torus_knot_complex` (twisting tube geometry, high curvature
-  variation) and `organic_blob_complex` (noise-displaced sphere, sculpt-like
-  surface) -- both tens of thousands of faces, aggressively reduced.
-- **Simple**: `box_simple` (lightly subdivided box) and `icosphere_simple`
-  (low-subdivision sphere) -- already low-poly, lightly reduced further to
-  show the pipeline doesn't over-simplify flat/minimal geometry.
-
-Output lands in the same places `generate_pairs.py` uses: raw meshes in
-`dataset/raw/`, `{name}_high.obj`/`{name}_low.obj` pairs in `dataset/pairs/`,
-and ready-to-train graphs in `dataset/processed/` -- so you can go straight to
-`python training/train.py` against this set, or inspect any pair directly:
+A small demo set (3 per category, already paired and processed) ships in the
+repo under `dataset/{raw,pairs,processed}/demo/`. For real training, generate
+at scale -- e.g. 500-1000 per category as recommended above:
 
 ```bash
-python inference/remesh.py dataset/raw/torus_knot_complex.obj out.obj --target_faces 800 --compare
+# 1. generate raw meshes (fast: a few minutes for 750/category)
+python dataset/make_sample_dataset.py --count_per_category 750 --out_dir dataset/raw
+
+# 2. build training graphs -- one call per category, tuned reduction ratios
+#    (complex meshes need aggressive reduction, simple ones need a gentle touch)
+python preprocessing/generate_pairs.py --input_dir dataset/raw/complex_knot   --reduction_ratio 0.08 --min_faces 200
+python preprocessing/generate_pairs.py --input_dir dataset/raw/organic_blob  --reduction_ratio 0.08 --min_faces 200
+python preprocessing/generate_pairs.py --input_dir dataset/raw/box_simple    --reduction_ratio 0.4  --min_faces 20
+python preprocessing/generate_pairs.py --input_dir dataset/raw/sphere_simple --reduction_ratio 0.4  --min_faces 20
 ```
 
-For real training you'll still want ABC/Objaverse/Thingi10K (below) -- this
-sample set is meant for smoke-testing the pipeline and demoing complex-vs-simple
-behavior, not as a serious training corpus.
+(all four calls write into the same shared `dataset/processed/` /
+`dataset/pairs/` -- filenames are already namespaced by category, e.g.
+`complex_knot_0347.obj`, so there's no collision.) `AI_Remesher_Training.ipynb`
+runs exactly this, with the count controlled by one variable you set at the
+top of the notebook.
 
-Drop your own raw meshes into `dataset/raw/`, then build the training set:
+Inspect any pair directly:
+
+```bash
+python inference/remesh.py dataset/raw/demo/complex_knot/complex_knot_0000.obj out.obj --target_faces 500 --compare
+```
+
+This dataset (procedural primitives/knots/blobs) is meant to give the model
+real complex-vs-simple structural variety to learn from without any
+licensing/download friction. For maximum realism, replace or augment it with
+ABC/Objaverse/Thingi10K (below).
+
+Drop your own raw meshes into `dataset/raw/` (flat or in subfolders --
+`generate_pairs.py --input_dir` searches recursively), then build the
+training set:
 
 ```bash
 python preprocessing/generate_pairs.py \

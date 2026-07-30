@@ -1,49 +1,54 @@
 """
-Generates a small, self-contained, license-clean sample dataset for
-AI-MeshOptimizer: two "complex" meshes (many polygons, intricate curvature /
-twisting topology) and two "simple" meshes (few polygons, basic shapes), each
-paired with an AI-MeshOptimizer-generated optimized ("low poly") counterpart.
+Procedural raw-mesh generator for AI-MeshOptimizer, spanning four categories:
 
-All meshes are generated procedurally with trimesh + numpy -- no external
-downloads, no licensing questions, fully reproducible. Useful as:
-  - a ready-to-open demo of "high poly in / low poly out" (dataset/raw, dataset/pairs)
-  - a tiny starter training set (dataset/processed), built with the exact
-    same feature extraction + QEM-labeling code as preprocessing/generate_pairs.py
+  complex_knot   -- twisting torus-knot tubes (complex topology, high curvature variation)
+  organic_blob   -- noise-displaced icospheres (organic, sculpt-like surfaces)
+  box_simple     -- lightly subdivided boxes (simple, flat, few features)
+  sphere_simple  -- low-subdivision icospheres (simple, rounded, few features)
 
-For serious training, replace/augment this with real scans from ABC Dataset /
-Objaverse / Thingi10K -- see README.md > Dataset. This script's meshes are
-deliberately modest in size (thousands, not millions, of faces) so the whole
-thing runs in well under a minute on a laptop CPU.
+Every mesh in a category is generated from the same procedure with randomized
+parameters (knot winding numbers, tube radius, resolution, noise seed/
+frequency, box extents, subdivision level, scale, rotation, ...), so a large
+`--count_per_category` produces genuine geometric variety rather than
+identical copies -- meaningful for training, not just a placeholder dataset.
+
+No external downloads, no licensing questions: everything is built with
+trimesh + numpy from closed-form / procedural formulas.
+
+This script ONLY generates raw meshes (dataset/raw/<category>/*.obj). It does
+NOT run QEM/feature extraction -- that's preprocessing/generate_pairs.py's
+job (run once per category, since complex and simple meshes want different
+--reduction_ratio). See README.md > Dataset for the exact commands, or just
+run AI_Remesher_Training.ipynb, which wires both stages together.
 
 Usage:
-    python dataset/make_sample_dataset.py
+    # small demo (fast, a handful of meshes per category)
+    python dataset/make_sample_dataset.py --count_per_category 3 --out_dir dataset/raw/demo
+
+    # full training-scale dataset (500-1000 per category; several minutes)
+    python dataset/make_sample_dataset.py --count_per_category 750 --out_dir dataset/raw
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
-import torch
 import trimesh
-from torch_geometric.data import Data
+from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from preprocessing.feature_extractor import extract_edge_features, extract_node_features, mesh_normalization_stats
 from preprocessing.mesh_loader import export_mesh, mesh_from_arrays, validate_mesh
-from utils.mesh_quality import quality_report
-from utils.qem import WeightedQEMSimplifier, compute_edge_qem_scores
 
-RAW_DIR = Path(__file__).resolve().parent / "raw"
-PAIRS_DIR = Path(__file__).resolve().parent / "pairs"
-PROCESSED_DIR = Path(__file__).resolve().parent / "processed"
+CATEGORIES = ["complex_knot", "organic_blob", "box_simple", "sphere_simple"]
+CATEGORY_SEED_ID = {name: i for i, name in enumerate(CATEGORIES)}
 
 
-def make_torus_knot(p: int = 3, q: int = 2, tube_radius: float = 0.3, u_res: int = 260, v_res: int = 36) -> trimesh.Trimesh:
-    """Complex example: a (p,q) torus-knot tube -- twisting topology, high curvature variation, many faces."""
+def _make_torus_knot(p: int, q: int, tube_radius: float, u_res: int, v_res: int) -> trimesh.Trimesh:
+    """A (p,q) torus-knot tube -- twisting topology, high curvature variation, many faces."""
     u = np.linspace(0, 2 * np.pi, u_res, endpoint=False)
     r = np.cos(q * u) + 2.0
     centerline = np.stack([r * np.cos(p * u), r * np.sin(p * u), -np.sin(q * u)], axis=1)
@@ -76,14 +81,16 @@ def make_torus_knot(p: int = 3, q: int = 2, tube_radius: float = 0.3, u_res: int
     return trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=True)
 
 
-def make_organic_blob(subdivisions: int = 5, seed: int = 0) -> trimesh.Trimesh:
-    """Complex example: a displaced icosphere -- organic sculpt-like surface, many faces."""
+def _make_organic_blob(subdivisions: int, rng: np.random.Generator) -> trimesh.Trimesh:
+    """A noise-displaced icosphere -- organic sculpt-like surface, many faces."""
     mesh = trimesh.creation.icosphere(subdivisions=subdivisions)
-    rng = np.random.default_rng(seed)
     directions = mesh.vertices / np.linalg.norm(mesh.vertices, axis=1, keepdims=True)
 
+    n_bands = int(rng.integers(3, 6))
     displacement = np.zeros(len(mesh.vertices))
-    for freq, amp in [(3.1, 0.06), (5.7, 0.035), (11.3, 0.02), (23.0, 0.01)]:
+    for _ in range(n_bands):
+        freq = float(rng.uniform(2.5, 25.0))
+        amp = float(rng.uniform(0.01, 0.07))
         phase = rng.uniform(0, 2 * np.pi, size=3)
         displacement += amp * np.sin(
             freq * directions[:, 0] + phase[0] + freq * directions[:, 1] + phase[1] + freq * directions[:, 2] + phase[2]
@@ -93,86 +100,102 @@ def make_organic_blob(subdivisions: int = 5, seed: int = 0) -> trimesh.Trimesh:
     return trimesh.Trimesh(vertices=new_vertices, faces=mesh.faces, process=True)
 
 
-def make_simple_box(subdivide_iters: int = 2) -> trimesh.Trimesh:
-    """Simple example: a box, lightly subdivided -- flat, few features, few faces."""
-    mesh = trimesh.creation.box(extents=[2.0, 1.2, 1.0])
-    for _ in range(subdivide_iters):
-        mesh = mesh.subdivide()
+def _random_transform(mesh: trimesh.Trimesh, rng: np.random.Generator, scale_range=(0.7, 1.4)) -> trimesh.Trimesh:
+    """Random anisotropic scale + rotation, so instances differ in pose, not just topology."""
+    mesh.apply_scale(rng.uniform(*scale_range, size=3))
+    mesh.apply_transform(trimesh.transformations.random_rotation_matrix(rng.random(3)))
     return mesh
 
 
-def make_simple_sphere(subdivisions: int = 1) -> trimesh.Trimesh:
-    """Simple example: a low-subdivision icosphere -- rounded, very few faces."""
-    return trimesh.creation.icosphere(subdivisions=subdivisions)
+def sample_complex_knot(rng: np.random.Generator) -> trimesh.Trimesh:
+    p = int(rng.integers(2, 6))
+    q = int(rng.integers(1, 4))
+    if p == q:
+        q = q + 1 if q + 1 < p else max(1, q - 1)
+    tube_radius = float(rng.uniform(0.22, 0.38))
+    u_res = int(rng.integers(120, 220))
+    v_res = int(rng.integers(20, 32))
+    mesh = _make_torus_knot(p, q, tube_radius, u_res, v_res)
+    return _random_transform(mesh, rng)
 
 
-# (name, category, mesh factory, target face count for the "optimized" pair)
-SAMPLES = [
-    ("torus_knot_complex", "complex", make_torus_knot, 1500),
-    ("organic_blob_complex", "complex", make_organic_blob, 1200),
-    ("box_simple", "simple", make_simple_box, 48),
-    ("icosphere_simple", "simple", make_simple_sphere, 40),
-]
+def sample_organic_blob(rng: np.random.Generator) -> trimesh.Trimesh:
+    subdivisions = int(rng.choice([3, 3, 4, 4, 5]))  # weighted toward smaller -> keeps average size down
+    mesh = _make_organic_blob(subdivisions, rng)
+    return _random_transform(mesh, rng)
 
 
-def build_graph(mesh: trimesh.Trimesh) -> Data:
-    node_features = extract_node_features(mesh)
-    edge_index_d, edge_attr_d, unique_edges, _ = extract_edge_features(mesh)
-    qem_scores = compute_edge_qem_scores(mesh.vertices, mesh.faces)
-    labels_unique = np.array([qem_scores[(int(i), int(j))] for i, j in unique_edges], dtype=np.float32)
-    labels_directed = np.concatenate([labels_unique, labels_unique])
-    return Data(
-        x=torch.from_numpy(node_features),
-        edge_index=torch.from_numpy(edge_index_d),
-        edge_attr=torch.from_numpy(edge_attr_d),
-        y=torch.from_numpy(labels_directed),
-    )
+def sample_box_simple(rng: np.random.Generator) -> trimesh.Trimesh:
+    extents = rng.uniform(0.6, 2.5, size=3)
+    subdivide_iters = int(rng.integers(1, 4))
+    mesh = trimesh.creation.box(extents=extents)
+    for _ in range(subdivide_iters):
+        mesh = mesh.subdivide()
+    return _random_transform(mesh, rng, scale_range=(0.9, 1.1))
+
+
+def sample_sphere_simple(rng: np.random.Generator) -> trimesh.Trimesh:
+    subdivisions = int(rng.integers(1, 4))
+    radius = float(rng.uniform(0.5, 1.5))
+    mesh = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
+    return _random_transform(mesh, rng, scale_range=(0.9, 1.1))
+
+
+GENERATORS = {
+    "complex_knot": sample_complex_knot,
+    "organic_blob": sample_organic_blob,
+    "box_simple": sample_box_simple,
+    "sphere_simple": sample_sphere_simple,
+}
+
+
+def generate_category(category: str, count: int, out_dir: Path, seed: int) -> list:
+    generator = GENERATORS[category]
+    category_dir = out_dir / category
+    category_dir.mkdir(parents=True, exist_ok=True)
+
+    face_counts = []
+    for idx in tqdm(range(count), desc=category, leave=False):
+        # SeedSequence-style per-item seeding: regenerating a single index later
+        # (e.g. after bumping --count_per_category) reproduces the same mesh.
+        # (uses CATEGORY_SEED_ID, not Python's hash(), which is randomized per process)
+        rng = np.random.default_rng((seed, CATEGORY_SEED_ID[category], idx))
+        raw_mesh = generator(rng)
+        mesh = validate_mesh(mesh_from_arrays(raw_mesh.vertices, raw_mesh.faces))
+        export_mesh(mesh, str(category_dir / f"{category}_{idx:04d}.obj"))
+        face_counts.append(len(mesh.faces))
+
+    return face_counts
 
 
 def main():
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    PAIRS_DIR.mkdir(parents=True, exist_ok=True)
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Generate procedural raw meshes for AI-MeshOptimizer.")
+    parser.add_argument("--count_per_category", type=int, default=4, help="Meshes to generate per category.")
+    parser.add_argument("--out_dir", default="dataset/raw", help="Output directory (one subfolder per category).")
+    parser.add_argument("--categories", nargs="+", choices=CATEGORIES, default=CATEGORIES)
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
 
-    rows = []
-    for name, category, factory, target_faces in SAMPLES:
-        t0 = time.time()
-        print(f"Generating {name} ({category}) ...")
-        raw_mesh = factory()
-        mesh = validate_mesh(mesh_from_arrays(raw_mesh.vertices, raw_mesh.faces))
+    out_dir = Path(args.out_dir)
+    print(f"Generating {args.count_per_category} mesh(es) per category into {out_dir}/ ...")
 
-        export_mesh(mesh, str(RAW_DIR / f"{name}.obj"))
-        export_mesh(mesh, str(PAIRS_DIR / f"{name}_high.obj"))
+    summary = []
+    for category in args.categories:
+        face_counts = generate_category(category, args.count_per_category, out_dir, args.seed)
+        summary.append((category, face_counts))
 
-        graph = build_graph(mesh)
-        center, scale = mesh_normalization_stats(mesh)
+    print("\n=== Generated raw meshes ===")
+    print(f"{'category':16s} {'count':>7s} {'min_faces':>10s} {'mean_faces':>11s} {'max_faces':>10s}")
+    for category, face_counts in summary:
+        fc = np.array(face_counts)
+        print(f"{category:16s} {len(fc):7d} {fc.min():10d} {fc.mean():11.0f} {fc.max():10d}")
 
-        simplifier = WeightedQEMSimplifier(mesh.vertices, mesh.faces)
-        low_v, low_f = simplifier.simplify(target_faces=target_faces, edge_importance=None)
-        low_mesh = mesh_from_arrays(low_v, low_f)
-        export_mesh(low_mesh, str(PAIRS_DIR / f"{name}_low.obj"))
-
-        graph.target_vertices = torch.from_numpy(((low_mesh.vertices - center) / scale).astype(np.float32))
-        graph.target_normals = torch.from_numpy(low_mesh.vertex_normals.astype(np.float32))
-        torch.save(graph, PROCESSED_DIR / f"{name}.pt")
-
-        report = quality_report(mesh, low_mesh)
-        elapsed = time.time() - t0
-        rows.append((name, category, len(mesh.faces), len(low_mesh.faces), report, elapsed))
-        print(f"  {len(mesh.faces)} -> {len(low_mesh.faces)} faces in {elapsed:.1f}s")
-
-    print("\n=== Sample dataset summary ===")
-    header = f"{'name':24s} {'category':9s} {'faces_high':>11s} {'faces_low':>10s} {'reduction%':>11s} {'hausdorff':>10s} {'chamfer':>10s}"
-    print(header)
-    for name, category, fh, fl, report, elapsed in rows:
-        print(
-            f"{name:24s} {category:9s} {fh:11d} {fl:10d} "
-            f"{report['face_reduction_percent']:11.1f} {report['hausdorff_distance']:10.4f} {report['chamfer_distance']:10.5f}"
-        )
-
-    print(f"\nRaw meshes       -> {RAW_DIR}")
-    print(f"High/low pairs   -> {PAIRS_DIR}")
-    print(f"Training graphs  -> {PROCESSED_DIR}")
+    print(f"\nRaw meshes -> {out_dir}/<category>/")
+    print(
+        "Next: build training graphs per category with preprocessing/generate_pairs.py "
+        "(complex categories want a low --reduction_ratio, e.g. 0.08; simple categories "
+        "want a higher one, e.g. 0.4 -- see README.md > Dataset)."
+    )
 
 
 if __name__ == "__main__":
